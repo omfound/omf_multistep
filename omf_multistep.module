@@ -1,0 +1,783 @@
+<?php
+
+/**
+ * This function should be called inside of a form callback. For instance if your form menu uses
+ * drupal_get_form and passes it mymodule_form, then a call to this function would go inside
+ * mymodule_form
+ */
+function omf_multistep_build_form($form, &$form_state, $field_array, $form_id, $review = false) {
+  $form['#tree'] = true;
+  $form['#omf_multistep'] = $form_id;
+  drupal_add_library('system', 'ui.dialog');
+
+  $form['#attached']['css'][] = drupal_get_path('module', 'omf_multistep') . '/css/multistep.css';
+
+  //initialize info (title, label, description) for all fields on this form
+  if (empty($form_state['field_meta'])) {
+    $array_shift = $field_array;
+    foreach ($array_shift as $key => $info) {
+      $form_state['field_meta'][$key+1] = $info;
+    }
+
+    if ($review) {
+      $form_state['field_meta'][] = array(
+        'title' => t('Review'),
+        'review' => true,
+      );
+    }
+
+    if (!empty($form_state['update_node'])) {
+      omf_multistep_prepopulate_node($form, $form_state, $form_id);
+    }
+
+    if (function_exists($form_id . '_default_values')) {
+      $function = $form_id . '_default_values';
+      $function($form, $form_state, $form_id);
+    }
+  }
+
+  //register current step
+  if (!isset($form_state['step'])) {
+    $form_state['step'] = 1; 
+  }
+  $step = &$form_state['step'];
+
+  if (!empty($form_state['field_meta'][$step]['stored_values'])) {
+    $form_state['values'] = $form_state['field_meta'][$step]['stored_values'];
+  }
+  $step_keys = omf_multistep_determine_step_keys($form, $form_state, $form_id);
+  $form_state['step_keys'] = $step_keys;
+
+  //register any js or css included in the step
+  if (!empty($form_state['field_meta'][$step_keys['key']]['js'])) {
+    foreach ($form_state['field_meta'][$step_keys['key']]['js'] as $key => $js_file) {
+      $form['#attached']['js'][] = $js_file;
+    }
+  }
+  if (!empty($form_state['field_meta'][$step_keys['key']]['css'])) {
+    foreach ($form_state['field_meta'][$step_keys['key']]['css'] as $key => $css_file) {
+      $form['#attached']['css'][] = $css_file;
+    }
+  }
+  if (!empty($form_state['field_meta'][$step_keys['key']]['library'])) {
+    foreach ($form_state['field_meta'][$step_keys['key']]['library'] as $key => $css_file) {
+      $form['#attached']['library'][] = $css_file;
+    }
+  }
+
+  drupal_add_js(array('dataset_contribute_form' => array('step' => $step)), array('type' => 'setting'));
+  
+  if (!empty($step_keys['subkey'])) {
+    $form['page-title'] = array(
+      '#markup' => '<h2>' . $form_state['field_meta'][$step_keys['key']][$step_keys['subkey']]['title'] . '</h2>',
+      '#weight' => -100,
+    );
+  }
+  else {
+    $form['page-title'] = array(
+      '#markup' => '<h2>' . $form_state['field_meta'][$step_keys['key']]['title'] . '</h2>',
+      '#weight' => -100,
+    );
+  }
+
+  if ($review && !empty($form_state['field_meta'][$step]['review'])) {
+    $form = omf_multistep_review_page($form, $form_state, $form_id);
+  }
+  else {
+    $form = omf_multistep_build_step($form, $form_state, $form_id);
+  }
+  omf_multistep_cache_steps($form_state);
+
+  $form['submit-start'] = array(
+    '#weight' => 80,
+    '#markup' => '<div id="submit-bar">', 
+  );
+
+  // Show the Next button only if there are more steps defined.
+  if ($step < count($form_state['field_meta'])) {
+    $form['next'] = array(
+      '#type' => 'submit',
+      '#value' => t('Continue'),
+      '#name' => 'next',
+      '#weight' => 85,
+      '#submit' => array('omf_multistep_next_submit'),
+      '#omf_multistep' => $form_id,
+    );
+  }
+
+  if ($step >= count($form_state['field_meta']) || !empty($form_state['update_node'])) {
+    $form['finish'] = array(
+      '#type' => 'submit',
+      '#value' => t('Save'),
+      '#weight' => 89,
+      '#submit' => array('omf_multistep_final_submit', $form_id . '_submit'),
+      '#omf_multistep' => $form_id,
+    );
+  }
+
+
+  if ($step > 1) {
+    $form['prev'] = array(
+      '#type' => 'submit',
+      '#value' => t('Previous'),
+      '#name' => 'prev',
+      '#submit' => array('omf_multistep_previous_submit'),
+      '#omf_multistep' => $form_id,
+      '#weight' => 88,
+      '#limit_validation_errors' => array(),
+    );
+  }
+
+  $form['cancel'] = array(
+    '#type' => 'submit',
+    '#submit' => array('omf_multistep_cancel_submit'),
+    '#value' => t('Cancel'),
+    '#name' => 'cancel',
+    '#omf_multistep' => $form_id,
+    '#weight' => 99,
+    '#limit_validation_errors' => array(),
+  );
+
+  $form['submit-end'] = array(
+    '#markup' => '</div>',
+    '#weight' => 101,
+  );
+
+  // Include each validation function defined for the different steps.
+  if (function_exists($form_id . '_step' . $step . '_validate')) {
+    $form['next']['#validate'] = array($form_id . '_step' . $step . '_validate');
+  }
+
+  // Add submit change handlers for each step,
+  // these are set to display none by default
+  $steps = omf_multistep_form_steps($form_state);
+  foreach ($steps as $key => $info) {
+    $submit_name = 'step' . $key . '_change';
+    $form[$submit_name] = array(
+      '#type' => 'submit',
+      '#submit' => array('omf_multistep_changes_submit'),
+      '#value' => $info['title'],
+      '#name' => $submit_name,
+      '#attributes' => array('class' => array('change-button')),
+      '#omf_multistep' => $form_id,
+    );
+  } 
+
+  return $form;
+}
+
+function omf_multistep_determine_step_keys($form, &$form_state, $module_name) {
+  $override = $module_name . '_determine_step_keys';
+  if (function_exists($override)) {
+    return $override($form, $form_state, $module_name);
+  } 
+  else {
+    $step_keys = array(
+      'key' => $form_state['step'],
+    );
+    return $step_keys;
+  }
+}
+
+/**
+ * Grabs all fields from a particular step and assembles them
+ * into field elements.
+ */
+function omf_multistep_build_step($form, &$form_state, $module_name) {
+  if (!empty($form_state['step_keys']['subkey'])) {
+    $step_meta = $form_state['field_meta'][$form_state['step_keys']['key']][$form_state['step_keys']['subkey']];
+  }
+  else {
+    $step_meta = $form_state['field_meta'][$form_state['step_keys']['key']];
+  }
+  foreach ($step_meta['fields'] as $field_name => $field_info) {
+    //no weight, set default
+    if (empty($field_info['weight'])) {
+      $field_info['weight'] = array_search($field_name, array_keys($step_meta['fields']));
+    }
+
+    if (!empty($field_info['add_another'])) {
+      $multikey = $field_name . '_multi';
+      $instances_key = $field_name . '_instances';
+      if (!empty($form_state['field_meta'][$form_state['step_keys']['key']]['stored_values'][$multikey])) {
+        $multistorage = $form_state['field_meta'][$form_state['step_keys']['key']]['stored_values'][$multikey];
+      }
+      if (empty($form_state[$instances_key]) && !empty($multistorage)) {
+        $form_state[$instances_key] = count($multistorage);
+      }
+
+      $form[$multikey] = omf_multistep_add_another_fields($field_name, $field_info, $form_state, $module_name);
+      $form[$multikey]['#weight'] = $field_info['weight'];
+      $notherkey = $field_name . '_nother';
+      $form[$notherkey] = array(
+        '#type' => 'submit',
+        '#value' => 'Add another',
+        '#name' => $field_name,
+        '#submit' => array('omf_multistep_add_field'),
+        '#weight' => $field_info['weight']+.1,
+        '#attributes' => array('class' => array('add-field')),
+      );
+      if ($form_state[$instances_key] > 1) {
+        $minuskey = $field_name . '_minus';
+        $form[$minuskey] = array(
+          '#type' => 'submit',
+          '#value' => 'Remove last',
+          '#name' => $field_name,
+          '#submit' => array('omf_multistep_remove_field'),
+          '#weight' => $field_info['weight']+.2,
+          '#attributes' => array('class' => array('remove-field')),
+        );
+      }
+      
+    }
+    else {
+      foreach ($field_info as $key => $value) {
+        if (!empty($field_info['type']) && $field_info['type'] == 'textfield' && $key == 'options') {
+          continue;
+        }
+        $att_key = '#'.$key;
+        $form[$field_name][$att_key] = $value;
+      }
+      $form[$field_name]['#omf_multistep'] = $module_name;
+
+      $form[$field_name]['#default_value'] = !empty($form_state['values'][$field_name]) ? $form_state['values'][$field_name] : false;
+      if (!empty($field_info['type']) && $field_info['type'] == 'text_format') {
+        if (is_array($form_state['values'][$field_name])) {
+          $form[$field_name]['#default_value'] = $form_state['values'][$field_name]['value'];
+        }
+      }
+
+      //Remove button handling for images..
+      $trigger = $field_name. '_remove_button';
+      if (!empty($form_state['input']['_triggering_element_name']) && $form_state['input']['_triggering_element_name'] == $trigger) {
+        $form[$field_name]['#default_value'] = NULL;
+        $form_state['values'][$field_name] = NULL;
+      }
+    }
+  }
+  return $form;
+}
+
+/**
+ * Previous submit handler
+ */
+function omf_multistep_previous_submit($form, &$form_state) {
+  $current_step = &$form_state['step'];
+  if ($current_step > 1) {
+    $current_step--;
+  }
+  $form_state['rebuild'] = TRUE;
+}
+
+/**
+ * Next submit handler
+ */
+function omf_multistep_next_submit($form, &$form_state) {
+  $current_step = &$form_state['step'];
+  $form_state['field_meta'][$current_step]['stored_values'] = $form_state['values'];
+
+  $current_step++;
+  /**
+  if (!empty($form_state['field_meta'][$current_step]['stored_values'])) {
+    $form_state['values'] = $form_state['field_meta'][$current_step]['stored_values'];
+  }
+  else {
+    $form_state['values'] = array();
+  }**/
+  $form_state['rebuild'] = TRUE;  // Force rebuild with next step.
+  return;
+}
+
+function omf_multistep_cancel_submit($form, &$form_state) {
+  if (!empty($form_state['update_node'])) {
+    drupal_goto('node/'.$form_state['update_node']);
+  }
+  else {
+    drupal_goto('<front>');
+  }
+}
+
+function omf_multistep_changes_submit($form, &$form_state) {
+  $current_step = &$form_state['step'];
+  $form_state['field_meta'][$current_step]['stored_values'] = $form_state['values'];
+
+  $change_step = preg_replace("/[^0-9]/","",$form_state['clicked_button']['#name']);
+  $form_state['rebuild'] = TRUE;
+  if (!empty($form_state['field_meta'][$change_step]['stored_values'])) {
+    $form_state['values'] = $form_state['field_meta'][$change_step]['stored_values'];
+  }
+  $form_state['step'] = $change_step;
+}
+
+function omf_multistep_final_submit($form, &$form_state) {
+  $current_step = &$form_state['step'];
+  if (empty($form_state['field_meta'][$current_step]['review'])) {
+    $form_state['field_meta'][$current_step]['stored_values'] = $form_state['values'];
+  }
+  omf_multistep_generate_node_array($form, $form_state); 
+}
+
+function omf_multistep_add_field($form, &$form_state) {
+  $field_name = $form_state['clicked_button']['#name'];
+  $instances_key = $field_name . '_instances';
+  $form_state[$instances_key]++;
+  $form_state['rebuild'] = TRUE;
+}
+
+function omf_multistep_remove_field($form, &$form_state) {
+  $field_name = $form_state['clicked_button']['#name'];
+  $instances_key = $field_name . '_instances';
+  $form_state[$instances_key]--;
+  $form_state['rebuild'] = TRUE;
+}
+
+/**
+ * Global validation handler that includes files typically
+ * lost during failed validation
+ */
+function omf_multistep_global_validation($form_state) {
+  drupal_add_library('system', 'ui.dialog');
+}
+
+/**
+ * Implementation of hook_theme()
+ */
+function omf_multistep_theme($existing, $type, $theme, $path) {
+  return array(
+    'omf_multistep_progress_bar' => array(
+      'path' => $path . '/theme',
+      'template' => 'progress_bar',
+      'variables' => array(
+        'steps' => NULL,
+      ),
+    ),
+    'omf_multistep_review' => array(
+      'path' => $path . '/theme',
+      'template' => 'review_page',
+      'variables' => array(
+        'steps' => NULL,
+      ),
+    ),
+  );
+}
+
+/**
+ * Generates a progress bar based on current step information
+ * See theme/progress_bar.tpl.php
+ */
+function omf_multistep_progress_bar() {
+  $steps = omf_multistep_get_steps();
+  if (!empty($steps)) {
+    return theme('omf_multistep_progress_bar', array('steps' => $steps));
+  }
+}
+
+function omf_multistep_review_page($form, $form_state, $module_name) {
+  $clean_steps = omf_multistep_clean_field_values($form, $form_state, $module_name);
+  $form['#attached']['css'][] = drupal_get_path('module', 'omf_multistep') . '/css/review.css';
+  $form['multistep_markup'] = array(
+    '#markup' => theme('omf_multistep_review', array('steps' => $clean_steps)), 
+  );
+  return $form;
+}
+
+function omf_multistep_clean_field_values($form, $form_state, $module_name) {
+  $clean_steps = array();
+  $invalid_keys = array('js', 'css');
+  foreach ($form_state['field_meta'] as $step => $step_info) {
+    if (!empty($step_info['review'])) {
+      continue;
+    }
+    $original_step = $form_state['step'];
+    $form_state['step'] = $step;
+    $step_keys = omf_multistep_determine_step_keys($form, $form_state, $module_name);
+    $form_state['step'] = $original_step;
+    if (!empty($step_keys['subkey'])) {
+      $storage = $step_info['stored_values'];
+      $step_info = $step_info[$step_keys['subkey']];
+      $step_info['stored_values'] = $storage;
+    } 
+    $clean_steps[$step]['title'] = $step_info['title'];
+    if (!empty($step_info['fields'])) {
+      $fields = $step_info['fields'];
+      $fields['stored_values'] = $step_info['stored_values'];
+    }
+    else {
+      $fields = $step_info;
+    }
+    foreach ($fields as $field_name => $field_info) {
+      if (!in_array($field_name, $invalid_keys) && !empty($field_info['type']) && $field_info['type'] != 'markup') {
+        if (!empty($field_info['add_another'])) {
+          $multikey = $field_name . '_multi';
+          if (!empty($fields['stored_values'][$multikey])) {
+            $multivalue = array();
+            foreach ($fields['stored_values'][$multikey] as $mkey => $mvalue) {
+              foreach ($mvalue as $zkey => $zvalue) {
+                $multivalue[] = $zvalue;
+              }
+            }
+            $value = implode(', ', $multivalue);
+          }
+        }
+        elseif (empty($step_info['stored_values'][$field_name])) {
+          $value = 'Not Entered';
+        }
+        else {
+          $value = $fields['stored_values'][$field_name];
+        }
+
+        if (is_array($value)) {
+          $multivalue = array();
+          foreach ($value as $mkey => $mvalue) {
+            if ($mvalue) {
+              $multivalue[] = $mvalue;
+            } 
+          }
+          $value = implode(', ', $multivalue);
+        }
+        $clean_steps[$step]['fields'][$field_name] = array(
+          'label' => $field_info['title'],
+          'value' => $value,
+          'value_label' => $value,
+        );
+        if ($field_info['type'] == 'checkbox') {
+          if ($value == 1) {
+            $clean_steps[$step]['fields'][$field_name]['value_label'] = 'Yes';
+          }
+          else {
+            $clean_steps[$step]['fields'][$field_name]['value_label'] = 'No';
+          }
+        }
+        if ($field_info['type'] == 'managed_file' || $field_info['type'] == 'file') {
+          $files = count(explode(',', $value));
+          $clean_steps[$step]['fields'][$field_name]['value'] = $value;
+          $clean_steps[$step]['fields'][$field_name]['value_label'] = $files . ' file/s';
+        }
+        elseif (count(explode(',', $value)) <= 1 && !empty($field_info['options'][$value])) {
+          $clean_steps[$step]['fields'][$field_name]['value_label'] = $field_info['options'][$value]; 
+        }
+        elseif (count(explode(',', $value)) > 1) {
+          $values = explode(', ', $value);
+          $lvalues = array();
+          foreach ($values as $mkey => $mvalue) {
+            if (!empty($field_info['options'][$mvalue])) {
+              $lvalues[] = $field_info['options'][$mvalue]; 
+            }
+          }
+          $clean_steps[$step]['fields'][$field_name]['value_label'] = implode(', ', $lvalues);
+        }
+      }
+    }
+  }
+
+  return $clean_steps;
+}
+
+/**
+ * Builds steps into a more functional array starting at 1
+ */
+function omf_multistep_form_steps($form_state) {
+  $steps = array();
+  $current_step = $form_state['step'];
+
+  foreach ($form_state['field_meta'] as $step_key => $step_info) {
+    if ($step_key < $current_step) {
+      $state = 'completed';
+    }
+    elseif ($step_key == $current_step) {
+      $state = 'current';
+    }
+    elseif ($step_key > $current_step) {
+      $state = 'future';
+    }
+    $steps[$step_key] = array('title' => $step_info['title'], 'state' => $state);
+  }
+
+  return $steps;
+}
+
+function omf_multistep_cache_steps($form_state = NULL) {
+  $steps = &drupal_static(__FUNCTION__);
+  if (!empty($form_state['field_meta'])) {
+    $steps = omf_multistep_form_steps($form_state);
+  }
+  return $steps;
+}
+
+function omf_multistep_get_steps() {
+  $steps = omf_multistep_cache_steps();
+  if (!isset($steps)) {
+    return false;
+  }
+  else {
+    return $steps;
+  }
+}
+
+function omf_multistep_block_info() {
+  $blocks['form-steps'] = array(
+    'info' => t('Form Step Status'),
+    'cache' => DRUPAL_NO_CACHE,
+  );
+
+  return $blocks;
+}
+
+function omf_multistep_block_view($delta = '') {
+  $block = array();
+  switch ($delta) {
+    case 'form-steps':
+      $block['subject'] = t('Current Step');
+      $block['content'] = omf_multistep_progress_bar(); 
+    break;
+  }
+
+  return $block;
+}
+
+function omf_multistep_add_another_fields($field_name, $field_info, &$form_state, $module_name) {
+  $instances_key = $field_name . '_instances';
+  if (empty($form_state[$instances_key])) {
+    $instances = 1;
+    $form_state[$instances_key] = 1;
+  }
+  else {
+    $instances = $form_state[$instances_key];
+  }
+  for ($i = 1; $i <= $instances; $i++) {
+    $add_another[$i] = array(
+      '#type' => 'fieldset',
+      '#title' => $i > 1 ? $field_info['title'] . ' ('.$i.')' : $field_info['title'],
+      '#collapsible' => true,
+      '#collapsed' => false,
+    );
+
+    foreach ($field_info as $key => $value) {
+      $att_key = '#'.$key;
+      $add_another[$i][$field_name][$att_key] = $value;
+    } 
+    $add_another[$i][$field_name]['#omf_multistep'] = $module_name;
+    $multikey = $field_name . '_multi';
+
+    //Remove button handling for images..
+    $trigger = $multikey. '_' .$i. '_' .$field_name. '_remove_button';
+    if (!empty($form_state['input']['_triggering_element_name']) && $form_state['input']['_triggering_element_name'] == $trigger) {
+      $add_another[$i][$field_name]['#default_value'] = NULL;
+      $form_state['values'][$multikey][$i][$field_name] = NULL;
+    }
+    else {
+      $add_another[$i][$field_name]['#default_value'] = !empty($form_state['values'][$multikey][$i][$field_name]) ? $form_state['values'][$multikey][$i][$field_name] : false;
+    }
+  }
+  return $add_another;
+}
+
+function omf_multistep_generate_node_array($form, &$form_state) {
+  $auto_node = array();
+  foreach ($form_state['field_meta'] as $step => $step_info) {
+    $original_step = $form_state['step'];
+    $form_state['step'] = $step;
+    $step_keys = omf_multistep_determine_step_keys($form, $form_state, $form['#omf_multistep']);
+    $form_state['step'] = $original_step;
+    if (!empty($step_keys['subkey'])) {
+      $storage = $step_info['stored_values'];
+      $step_info = $step_info[$step_keys['subkey']];
+      $step_info['stored_values'] = $storage;
+    } 
+    foreach ($step_info['fields'] as $field_name => $field_info) {
+      if (!empty($field_info['node_field'])) {
+        $node_field = $field_info['node_field'];
+      }
+      else {
+        $node_field = $field_name;
+      }
+
+      if (empty($field_info['type'])) {
+        $field_info['type'] = 'markup';
+      }
+
+      switch ($field_info['type']) {
+        case 'textfield':
+        case 'textarea':
+          if (!empty($field_info['add_another'])) {
+            if (!empty($step_info['stored_values'][$field_name . '_multi'])) {
+              foreach ($step_info['stored_values'][$field_name . '_multi'] as $mkey => $mvalue) {
+		$auto_node[$node_field][LANGUAGE_NONE][]['value'] = $mvalue[$field_name];
+              }
+            }
+          }
+          else {
+            if ($field_name != 'title') {
+              $auto_node[$node_field][LANGUAGE_NONE][0]['value'] = isset($step_info['stored_values'][$field_name]) ? $step_info['stored_values'][$field_name] : ''; 
+            }
+            else {
+              $auto_node[$node_field] = isset($step_info['stored_values'][$field_name]) ? $step_info['stored_values'][$field_name] : ''; 
+            }
+          }
+          break;
+        case 'select':
+        case 'checkbox':
+        case 'checkboxes':
+          if (!empty($field_info['add_another'])) {
+            if (!empty($step_info['stored_values'][$field_name . '_multi'])) {
+              foreach ($step_info['stored_values'][$field_name . '_multi'] as $mkey => $mvalue) {
+                if (!empty($mvalue[$field_name]) || ($field_info['type'] != 'checkbox' && $field_info['type'] != 'checkboxes')) {
+	          $auto_node[$node_field][LANGUAGE_NONE][]['value'] = $mvalue[$field_name];
+                }
+              }
+            }
+          }
+          else {
+	    if (isset($step_info['stored_values'][$field_name])) {
+              if (is_array($step_info['stored_values'][$field_name])) {
+		foreach ($step_info['stored_values'][$field_name] as $skey => $svalue) {
+                  if (!empty($svalue) || ($field_info['type'] != 'checkbox' && $field_info['type'] != 'checkboxes')) {
+	            $auto_node[$node_field][LANGUAGE_NONE][]['value'] = $svalue;
+                  }
+		}
+	      }
+	      else {
+                if (!empty($step_info['stored_values'][$field_name]) || ($field_info['type'] != 'checkbox' && $field_info['type'] != 'checkboxes')) {
+		  $auto_node[$node_field][LANGUAGE_NONE][0]['value'] = $step_info['stored_values'][$field_name];
+                }
+	      }
+	    }
+          }
+          break;
+        case 'managed_file':
+          if (!empty($field_info['add_another'])) {
+            if (!empty($step_info['stored_values'][$field_name . '_multi'])) {
+              foreach ($step_info['stored_values'][$field_name . '_multi'] as $mkey => $mvalue) {
+                if (!empty($mvalue[$field_name])) {
+                  $file = file_load($mvalue[$field_name]);
+                  if ($file->status == 1) {
+                    $keep_file = (array)$file;
+                    $keep_file['display'] = 1;
+                    $auto_node[$node_field][LANGUAGE_NONE][] = $keep_file;
+                  }
+                  else {
+                    $auto_node[$node_field][LANGUAGE_NONE][] = array(
+                      'fid' => $mvalue[$field_name],
+                      'display' => 1,
+                      'description' => '',
+                    );
+                  }
+                }
+              }
+            }
+          }
+          elseif (isset($step_info['stored_values'][$field_name])) {
+            if (is_array($step_info['stored_values'][$field_name])) {
+              foreach ($step_info['stored_values'][$field_name] as $fkey => $fvalue) {
+                if (!empty($fvalue)) {
+                  $file = file_load($fvalue);
+                  if ($file->status == 1) {
+                    $keep_file = (array)$file;
+                    $keep_file['display'] = 1;
+                    $auto_node[$node_field][LANGUAGE_NONE][] = $keep_file;
+                  }
+                  else { 
+                    $auto_node[$node_field][LANGUAGE_NONE][] = array(
+                      'fid' => $fvalue,
+                      'display' => 1,
+                      'description' => '',
+                    );
+                  }
+                }
+              }
+            }
+            else {
+              if (!empty($fvalue)) {
+                $file = file_load($step_info['stored_values'][$field_name]);
+                if ($file->status == 1) {
+                  $keep_file = (array)$file;
+                  $keep_file['display'] = 1;
+                  $auto_node[$node_field][LANGUAGE_NONE][] = $keep_file;
+                }
+                else {
+                  $auto_node[$node_field][LANGUAGE_NONE][0] = array(
+                    'fid' => $step_info['stored_values'][$field_name],
+                    'display' => 1,
+                    'description' => '',
+                  );
+                }
+              }
+            }
+          } 
+          break;
+      }
+    }
+  }
+  $form_state['field_meta']['node_values'] = $auto_node;
+}
+
+function omf_multistep_prepopulate_node($form, &$form_state, $module_name) {
+  $node = node_load($form_state['update_node']);
+  foreach ($form_state['field_meta'] as $step => $step_info) {
+    if (!empty($step_info['review'])) {
+      continue;
+    }
+    $original_step = $form_state['step'];
+    $form_state['step'] = $step;
+    $step_keys = omf_multistep_determine_step_keys($form, $form_state, $form['#omf_multistep']);
+    $form_state['step'] = $original_step;
+    if (!empty($step_keys['subkey'])) {
+      $storage = $step_info['stored_values'];
+      $step_info = $step_info[$step_keys['subkey']];
+      $step_info['stored_values'] = $storage;
+    } 
+
+    foreach ($step_info['fields'] as $field_name => $field_info) {
+      if (!empty($field_info['node_field'])) {
+        $node_field = $field_info['node_field'];
+      }
+      else {
+        $node_field = $field_name;
+      }
+
+      if (!empty($node->{$node_field})) {
+        if ($node_field == 'title') {
+          $field_value = array(array(
+            'value' => $node->title
+          ));
+          $value_key = 'value';
+        }
+        else {
+          $field_value = field_get_items('node', $node, $node_field);
+          $node_field_info = field_info_instance('node', $node_field, $node->type);
+          $value_key = 'value';
+          switch ($node_field_info['widget']['type']) {
+            case 'file_generic':
+              $value_key = 'fid';
+              break;
+            case 'link_field':
+              $value_key = 'url';
+              break;
+          }
+        }
+        if (!empty($field_info['add_another'])) {
+          $counter = 1;
+          foreach ($field_value as $dkey => $dinfo) {
+            $form_state['field_meta'][$step]['stored_values'][$field_name . '_multi'][$counter][$field_name] = $dinfo[$value_key];
+            $counter++;
+          }
+        }
+        elseif (!empty($field_info['multiple']) || $field_info['type'] == 'checkboxes') {
+          foreach ($field_value as $dkey => $dinfo) {
+            $form_state['field_meta'][$step]['stored_values'][$field_name][$dinfo[$value_key]] = $dinfo[$value_key];
+          }
+        }
+        else {
+          $form_state['field_meta'][$step]['stored_values'][$field_name] = $field_value[0][$value_key];
+        }
+      }
+    }
+  }
+
+  //make a backup of original defaults for later use
+  foreach ($form_state['field_meta'] as $step => $step_info) {
+    if (empty($step_info['review'])) {
+      $form_state['orig_values'][$step]['stored_values'] = $step_info['stored_values'];
+    }
+  }
+}

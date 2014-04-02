@@ -1,0 +1,13 @@
+table.step-table {
+  width: 100%;
+}
+
+table.step-table td.step-field-label {
+  width: 45%;
+}
+table.step-table td.step-field-value {
+  width: 45%;
+}
+table.step-table td.step-field-edit {
+  width: 10%;
+}

@@ -1,0 +1,3 @@
+name = OMF Multistep
+description = Provides multistep functionality for any form
+core = 7.x

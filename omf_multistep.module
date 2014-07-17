@@ -240,7 +240,7 @@ function omf_multistep_build_step($form, &$form_state, $module_name) {
       }
       $form[$field_name]['#omf_multistep'] = $module_name;
 
-      $form[$field_name]['#default_value'] = !empty($form_state['values'][$field_name]) ? $form_state['values'][$field_name] : false;
+      $form[$field_name]['#default_value'] = !empty($form_state['values'][$field_name]) ? $form_state['values'][$field_name] : NULL;
       if (!empty($field_info['type']) && $field_info['type'] == 'text_format') {
         if (is_array($form_state['values'][$field_name])) {
           $form[$field_name]['#default_value'] = $form_state['values'][$field_name]['value'];
